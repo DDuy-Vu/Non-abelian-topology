@@ -6,6 +6,7 @@ import shutil
 import functools
 
 from netket.operator.spin import sigmax, sigmaz, sigmay, identity
+import jax
 import jax.numpy as jnp
 from scipy import sparse
 import jax.tree_util
@@ -31,9 +32,30 @@ from scipy.stats import gmean
 import json
 
 def CZ(hi, site1, site2):
-    D = np.array([[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,-1]])
-    D = sparse.coo_matrix(D)
-    return  nk.operator.LocalOperator(hi, D, [site1, site2], dtype=float).to_jax_operator()
+    # Controlled-Z on spin eigenvalues z = +/-1:
+    # CZ = (I + Z_i + Z_j - Z_i Z_j) / 2
+    return (identity(hi) + sigmaz(hi, site1) + sigmaz(hi, site2) - (sigmaz(hi, site1) @ sigmaz(hi, site2))) / 2
+
+
+@functools.lru_cache(maxsize=1)
+def _ruby_jx_local_matrix():
+    # NetKet's spin basis is ordered as [1, -1].
+    states = 1 - 2 * np.array(
+        [[(index >> shift) & 1 for shift in range(5, -1, -1)] for index in range(2**6)],
+        dtype=np.int8,
+    )
+    edges = np.array([(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0)], dtype=np.int8)
+    phase = np.ones(states.shape[0], dtype=np.float64)
+    for i, j in edges:
+        phase *= (1 + states[:, i] + states[:, j] - states[:, i] * states[:, j]) / 2
+
+    cz_ring = sparse.diags(phase, format="csr")
+    sx = sparse.csr_matrix(np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float64))
+    x_ring = sx
+    for _ in range(5):
+        x_ring = sparse.kron(x_ring, sx, format="csr")
+
+    return sparse.kron(cz_ring, x_ring, format="csr")
 
 @nk.utils.struct.dataclass
 class Gauge_trans(nk.sampler.rules.MetropolisRule):
@@ -79,16 +101,14 @@ def Ruby_Hamiltonian(hi, Jz, Jx):
     ha = 0 * identity(hi)
 
     if Jz != 0:
-        ha += Jz * sum([sigmaz(hi, u[0]) * sigmaz(hi, u[2]) * sigmaz(hi, u[4]) for u in g.plaquette_list.tolist()])
-        ha += Jz * sum([sigmaz(hi, u[1]) * sigmaz(hi, u[3]) * sigmaz(hi, u[5]) for u in g.plaquette_list.tolist()])
+        ha += Jz * sum([(sigmaz(hi, u[0]) @ sigmaz(hi, u[2]) @ sigmaz(hi, u[4])) for u in g.plaquette_list.tolist()])
+        ha += Jz * sum([(sigmaz(hi, u[1]) @ sigmaz(hi, u[3]) @ sigmaz(hi, u[5])) for u in g.plaquette_list.tolist()])
     
     if Jx != 0:
+        local_matrix = _ruby_jx_local_matrix()
         for i in range(g.N_plaquette):
-            u = g.plaquette_list[i].tolist()
-            s = CZ(hi, u[0], u[1]) * CZ(hi, u[1], u[2]) * CZ(hi, u[2], u[3]) * CZ(hi, u[3], u[4]) * CZ(hi, u[4], u[5]) * CZ(hi, u[5], u[0])
-
-            u = g.X_list[i].tolist()
-            s *= sigmax(hi, u[0]) * sigmax(hi, u[1]) * sigmax(hi, u[2]) * sigmax(hi, u[3]) * sigmax(hi, u[4]) * sigmax(hi, u[5])
+            support = np.concatenate((np.array(g.plaquette_list[i]), np.array(g.X_list[i]))).tolist()
+            s = nk.operator.LocalOperator(hi, local_matrix, support, dtype=float).to_jax_operator()
             ha += Jx * s
 
     return ha
@@ -122,23 +142,55 @@ class conv(nn.Module):
     W_scale: float = 1.0
     b_scale: float = 1.0
     kersize: int = 2
+    use_color_labels: bool = False
     dtype: type =  complex
 
     @nn.compact
     def __call__(self,x):
         
         size = x.shape
-        W =  self.param('W',nn.initializers.normal(stddev = self.W_scale*0.5/jnp.sqrt(self.kersize**2*(size[2]+self.out_features))),
-                (self.kersize**2, size[2], self.out_features,), self.dtype)
-        if self.kersize == 2:         
-            y = jnp.tensordot(x[:, g.kernel2,:], W, axes=([2,3],[0,1]))
+        N_kernel = self.kersize**2
+        mask = g.kernel2 if self.kersize == 2 else g.kernel3
+        offset_mask = mask[:, :, 0].astype(jnp.int32)
+        if self.use_color_labels:
+            color_mask = mask[:, :, 1].astype(jnp.int32)
+            target_colors = color_mask[:, 0]
+            W = self.param(
+                'W',
+                nn.initializers.normal(stddev=self.W_scale * 0.5 / jnp.sqrt(N_kernel * (size[2] + self.out_features))),
+                (g.n_unit_cell_colors, N_kernel, size[2], self.out_features),
+                self.dtype,
+            )
+            W = jnp.pad(W, pad_width=((0, 0), (0, 1), (0, 0), (0, 0)), constant_values=0j)
+            kernel = W[color_mask, offset_mask]
         else:
-            y = jnp.tensordot(x[:, g.kernel3,:], W, axes=([2,3],[0,1]))
+            W = self.param(
+                'W',
+                nn.initializers.normal(stddev=self.W_scale * 0.5 / jnp.sqrt(N_kernel * (size[2] + self.out_features))),
+                (N_kernel, size[2], self.out_features),
+                self.dtype,
+            )
+            W = jnp.pad(W, pad_width=((0, 1), (0, 0), (0, 0)), constant_values=0j)
+            kernel = W[offset_mask]
+        y = jax.lax.dot_general(x, kernel, (((1, 2), (0, 2)), ((), ())))
         
         if self.b_scale > 1e-5:
-            b =  self.param('b',nn.initializers.normal(stddev = self.b_scale*0.5/jnp.sqrt(self.kersize**2*(size[2]+self.out_features))),
-                    (self.out_features,), self.dtype)        
-            y += jnp.tensordot(jnp.ones((size[0],size[1])), b, axes=0)
+            if self.use_color_labels:
+                b = self.param(
+                    'b',
+                    nn.initializers.normal(stddev=self.b_scale * 0.5 / jnp.sqrt(N_kernel * (size[2] + self.out_features))),
+                    (g.n_unit_cell_colors, self.out_features),
+                    self.dtype,
+                )
+                y += b[target_colors][jnp.newaxis, :, :]
+            else:
+                b = self.param(
+                    'b',
+                    nn.initializers.normal(stddev=self.b_scale * 0.5 / jnp.sqrt(N_kernel * (size[2] + self.out_features))),
+                    (self.out_features,),
+                    self.dtype,
+                )
+                y += b[jnp.newaxis, jnp.newaxis, :]
         
         return y
     
@@ -149,6 +201,7 @@ class conv2(nn.Module):
     W_scale: float = 1.0
     b_scale: float = 1.0
     ker_size: int = 2
+    use_color_labels: bool = False
     dtype: type =  complex
 
     @nn.compact
@@ -156,29 +209,68 @@ class conv2(nn.Module):
         
         size = x.shape
         N_kernel = self.ker_size**2
-
-        W =  jnp.pad(self.param('W',nn.initializers.normal(stddev = self.W_scale*0.5/jnp.sqrt(N_kernel * size[-1])), (N_kernel, size[-1], self.out_features), self.dtype), 
-                        pad_width = ((0, 1), (0, 0), (0, 0)), constant_values = 0j)
-        kernel = jnp.take(W, g.kernel2, axis = 0) if self.ker_size == 2 else jnp.take(W, g.kernel3, axis = 0)
+        mask = g.kernel2 if self.ker_size == 2 else g.kernel3
+        offset_mask = mask[:, :, 0].astype(jnp.int32)
+        if self.use_color_labels:
+            color_mask = mask[:, :, 1].astype(jnp.int32)
+            target_colors = color_mask[:, 0]
+            W = jnp.pad(
+                self.param(
+                    'W',
+                    nn.initializers.normal(stddev=self.W_scale * 0.5 / jnp.sqrt(N_kernel * size[-1])),
+                    (g.n_unit_cell_colors, N_kernel, size[-1], self.out_features),
+                    self.dtype,
+                ),
+                pad_width=((0, 0), (0, 1), (0, 0), (0, 0)),
+                constant_values=0j,
+            )
+            kernel = W[color_mask, offset_mask]
+        else:
+            W = jnp.pad(
+                self.param(
+                    'W',
+                    nn.initializers.normal(stddev=self.W_scale * 0.5 / jnp.sqrt(N_kernel * size[-1])),
+                    (N_kernel, size[-1], self.out_features),
+                    self.dtype,
+                ),
+                pad_width=((0, 1), (0, 0), (0, 0)),
+                constant_values=0j,
+            )
+            kernel = W[offset_mask]
         y = jax.lax.dot_general(x, kernel, (( (1, 2), (0, 2)), ((), ())))
 
         if self.b_scale > 1e-5:
-            b =  self.param('b',nn.initializers.normal(stddev = self.b_scale*0.5/jnp.sqrt(N_kernel* self.out_features)), (self.out_features,), self.dtype)        
-            y += b[jnp.newaxis, jnp.newaxis, :]
+            if self.use_color_labels:
+                b = self.param(
+                    'b',
+                    nn.initializers.normal(stddev=self.b_scale * 0.5 / jnp.sqrt(N_kernel * self.out_features)),
+                    (g.n_unit_cell_colors, self.out_features),
+                    self.dtype,
+                )
+                y += b[target_colors][jnp.newaxis, :, :]
+            else:
+                b = self.param(
+                    'b',
+                    nn.initializers.normal(stddev=self.b_scale * 0.5 / jnp.sqrt(N_kernel * self.out_features)),
+                    (self.out_features,),
+                    self.dtype,
+                )
+                y += b[jnp.newaxis, jnp.newaxis, :]
         
         return y
 
     
 class deep_CNN(nn.Module):
     n_features: int
+    use_color_labels: bool = False
     @nn.compact
     
     def __call__(self, x):
 
         ### Convolutional NN
-        y1b = conv2(out_features = self.n_features, ker_size = 3)(x)
-        y1b = conv2(out_features = self.n_features, ker_size = 3)(activation2(y1b))
-        # y1b = conv2(out_features = self.n_features, ker_size = 3)(activation2(y1b))
+        y1b = conv2(out_features = self.n_features, ker_size = 3, use_color_labels = self.use_color_labels)(x)
+        y1b = conv2(out_features = self.n_features, ker_size = 3, use_color_labels = self.use_color_labels)(activation2(y1b))
+        y1b = conv2(out_features = self.n_features, ker_size = 3, use_color_labels = self.use_color_labels)(activation2(y1b))
 
         return y1b
     
@@ -244,6 +336,8 @@ def phase2(x0):
 class CNN_symmetric(nn.Module):
 
     rotation: bool = True
+    use_small_point_group: bool = False
+    use_color_labels: bool = False
     freeze_mag: bool = False
     freeze_phase: bool = False
 
@@ -253,29 +347,30 @@ class CNN_symmetric(nn.Module):
         
         ##### Add symmetric copies  #############
         # Swaping sublattice ##################### 
+        rotation_group = g.small_point_group if self.use_small_point_group else g.point_group
         if self.rotation:
-            x = x[:, g.point_group].reshape((-1, g.N))
+            x = x[:, rotation_group].reshape((-1, g.N))
 
         size = x.shape
 
         u =   phase2(x) #x.reshape((x.shape[0], x.shape[1]//3, 3)) # 
-        y1 =  deep_CNN(n_features = 6)(u)
+        y1 =  deep_CNN(n_features = 8, use_color_labels = self.use_color_labels)(u)
 
         u = jnp.stack((jnp.prod(x[:, g.left_triangles], axis = -1), jnp.prod(x[:, g.right_triangles], axis = -1)), axis = -1)
-        y2 =  deep_CNN(n_features = 6)(u)
+        y2 =  deep_CNN(n_features = 8, use_color_labels = self.use_color_labels)(u)
 
         out = activation4(y1 + y2)
         out = jnp.sum(out, axis = [1, 2]) / jnp.sqrt(3)
          
         if self.rotation:
-            out = out.reshape(-1, len(g.point_group))
+            out = out.reshape(-1, rotation_group.shape[0])
             out = jnp.log(jnp.mean(jnp.exp(out), axis = -1))
 
         return out
     
 
 
-def evolve(vstate, h0, nstep, dt, index_range, op, show_progress = True): 
+def evolve(vstate, h0, nstep, dt, index_range, show_progress = True, log_path = "log_data_L6_perturbed"): 
 
     def single_update(vstate):  
 
@@ -317,14 +412,9 @@ def evolve(vstate, h0, nstep, dt, index_range, op, show_progress = True):
     rcond = 1e-6
     index_range = jnp.arange(vstate.n_parameters)
 
-    data = {"gamma_n": [], "E": [], "Bp": []} 
+    data = {"gamma_n": [], "E": [], "E_Var": []} 
 
     for _ in enumerate(loop):
-
-        # if n % 150 == 0:
-        #     rcond = rcond / 3
-            # print("change random parameters")
-            # index_range = np.random.choice(vstate.n_parameters, size = 800, replace = False)
 
         old_pars = vstate.parameters
         k1, E = single_update(vstate)
@@ -334,7 +424,7 @@ def evolve(vstate, h0, nstep, dt, index_range, op, show_progress = True):
         vstate.parameters = jax.tree_util.tree_map(lambda x, y1, y2: x + 0.5*lr*(y1+y2) , old_pars, k1, k2)
         
         data["E"].append(jnp.real(E.Mean).item())
-        data["Bp"].append(jnp.real(vstate.expect(op).Mean).item())
+        data["E_Var"].append(jnp.real(E.Variance).item())
         data["gamma_n"].append(n*lr)
 
         n += 1
@@ -342,62 +432,5 @@ def evolve(vstate, h0, nstep, dt, index_range, op, show_progress = True):
         if show_progress:
             loop.set_description(str(E) + " " + str(vstate.sampler_state.acceptance))
     
-    json.dump(data, open("log_data_L6_perturbed","w"))
-    return E
-
-
-def train_fidelity(vstate, overlap, nstep, dt, show_progress = True): 
-
-    def single_update(vstate):  
-
-        E, F = vstate.expect_and_grad(overlap)
-        F, reassemble = convert_tree_to_dense_format(F, "holomorphic")
-
-        S = vstate.quantum_geometric_tensor(nk.optimizer.qgt.QGTJacobianDense(mode = "holomorphic"))
-        O = S.O[:,  index_range]
-        Sd = mpi.mpi_sum_jax(O.conj().T @ O)[0] + rcond*jnp.eye(len(index_range))
-
-        #### Regularizing based on rotated F / eigs of S
-        ev, V = jnp.linalg.eigh(Sd)
-        rho = V.conj().T @ F
-
-        #### Regularizing based on rotated F / eigs of S
-    
-        ev_inv = rho/ev
-        filter = np.where(np.abs(ev/ev[-1]) > 1e-5, 1e1, np.where(np.abs(ev/ev[-1]) > 1e-8, 0.5, 0.01 ))
-        ev_inv = np.where((np.abs(ev_inv) >= filter), filter * ev_inv/np.abs(ev_inv), ev_inv)
-        update = jnp.zeros((vstate.n_parameters), dtype = complex)
-        update = update.at[index_range].set(V @ ev_inv)
-
-        dw = tree_cast (reassemble(update), vstate.parameters)
-
-        return dw, E
-
-    lr = -dt/nstep
-    loop = tqdm(range(nstep)) if show_progress else range(nstep)
-    n = 0
-    rcond = 1e-6
-    index_range = jnp.arange(vstate.n_parameters)
-    
-
-
-    for _ in enumerate(loop):
-
-        # if n % 150 == 0:
-        #     rcond = rcond / 3
-            # print("change random parameters")
-            # index_range = np.random.choice(vstate.n_parameters, size = 800, replace = False)
-
-        old_pars = vstate.parameters
-        k1, E = single_update(vstate)
-        vstate.parameters = jax.tree_util.tree_map(lambda x, y: x + lr*y , old_pars, k1)
-        
-        k2, E = single_update(vstate)
-        vstate.parameters = jax.tree_util.tree_map(lambda x, y1, y2: x + 0.5*lr*(y1+y2) , old_pars, k1, k2)
-
-        n += 1
-
-        if show_progress:
-            loop.set_description(str(E) + " " + str(vstate.sampler_state.acceptance))
-
+    json.dump(data, open(log_path, "w"))
     return E
