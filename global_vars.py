@@ -24,11 +24,16 @@ N_plaquette = None
 N = None
 
 plaquette_list = X_list= None
+plaquette_list_r = plaquette_list_g = plaquette_list_b = None
+site_list_r = site_list_g = site_list_b = None
+plaquette_color_labels = site_color_labels = None
+n_unit_cell_colors = None
 mat_link0 = mat_link1 = mat_link2 = None
 gauss_check = plaquette_check1 = plaquette_check2 = None
 
 kernel2 = kernel3 = None
 ker_size = None
+point_group = small_point_group = None
 
 def gf2_gaussian_elimination(A, b):
     """
@@ -134,10 +139,19 @@ def left_inverse_mod2(A_np):
 
     return np.array(B, dtype=np.uint8)
 
-def generate_mask(N_cell, ker_size, L):
+def generate_mask(N_cell, ker_size, L, color_labels=None):
 
     n_elms = ker_size**2
-    ker = np.full((N_cell, N_cell), n_elms)
+    if color_labels is None:
+        color_labels = np.zeros(N_cell, dtype=np.int8)
+    else:
+        color_labels = np.asarray(color_labels, dtype=np.int8)
+        if color_labels.shape != (N_cell,) or np.any(color_labels < 0):
+            color_labels = np.zeros(N_cell, dtype=np.int8)
+
+    ker = np.zeros((N_cell, N_cell, 2), dtype=np.int16)
+    ker[:, :, 0] = n_elms
+    ker[:, :, 1] = color_labels[:, None]
     
     n = 0
     for del_j, del_i in product(range(-math.floor(ker_size/2), math.ceil(ker_size/2)), range(-math.floor(ker_size/2), math.ceil(ker_size/2))):
@@ -146,7 +160,8 @@ def generate_mask(N_cell, ker_size, L):
             i2, j2 = i + del_i, j + del_j
             c2 = coor2in(i2, j2, L)
 
-            ker[c1, c2] = n
+            ker[c1, c2, 0] = n
+            ker[c1, c2, 1] = color_labels[c1]
 
         n += 1
 
@@ -154,7 +169,9 @@ def generate_mask(N_cell, ker_size, L):
 
 def update_globals():
     global N_plaquette, N, plaquette_list, X_list, X_list_r, X_list_b, X_list_g, left_triangles, right_triangles
-    global kernel2, kernel3, transform_matrix, point_group, inverse_matrix
+    global plaquette_list_r, plaquette_list_g, plaquette_list_b
+    global site_list_r, site_list_g, site_list_b, plaquette_color_labels, site_color_labels, n_unit_cell_colors
+    global kernel2, kernel3, transform_matrix, point_group, small_point_group, inverse_matrix
     global adjacent_matrix, path_matrix, translation_cell, translation_site, kx, ky
 
     if L is not None:
@@ -188,10 +205,6 @@ def update_globals():
         
         translation_site, translation_cell = jnp.array(translation_site), jnp.array(translation_cell)
 
-        kernel2 = generate_mask(L**2, 2, L)
-        kernel3 = generate_mask(L**2, 3, L)
-
-
         C6_matrix = np.zeros(N, dtype = int)
         for j, i in product(range(L), range(L)):
             i2 = i - j
@@ -214,15 +227,43 @@ def update_globals():
             point_group.append(C)
 
         point_group = jnp.array(point_group)
+        small_point_group = jnp.array(point_group[::2])
 
         transform_matrix = np.full((N, len(X_list)), 0, dtype=jnp.int8)
         for i in range(len(X_list)):
             transform_matrix[X_list[i],i] = 1
 
+        plaquette_list_r = plaquette_list_g = plaquette_list_b = None
+        site_list_r = site_list_g = site_list_b = None
+        plaquette_color_labels = -jnp.ones(N_plaquette, dtype=jnp.int8)
+        site_color_labels = -jnp.ones(N, dtype=jnp.int8)
+        n_unit_cell_colors = 1
+
         if L % 3 == 0:
             X_list_r = jnp.array([coor2in(i,j,L) for j in range(L) for i in range(L) if (i+j)%3 == 0])
             X_list_g = jnp.array([coor2in(i,j,L) for j in range(L) for i in range(L) if (i+j)%3 == 1])
             X_list_b = jnp.array([coor2in(i,j,L) for j in range(L) for i in range(L) if (i+j)%3 == 2])
+
+            plaquette_list_r = X_list_r
+            plaquette_list_g = X_list_g
+            plaquette_list_b = X_list_b
+
+            plaquette_color_labels = np.full(N_plaquette, -1, dtype=np.int8)
+            plaquette_color_labels[np.array(plaquette_list_r)] = 0
+            plaquette_color_labels[np.array(plaquette_list_g)] = 1
+            plaquette_color_labels[np.array(plaquette_list_b)] = 2
+            plaquette_color_labels = jnp.array(plaquette_color_labels)
+
+            site_list_r = jnp.array(np.sort(np.unique(np.array(X_list)[np.array(plaquette_list_r)].reshape(-1))))
+            site_list_g = jnp.array(np.sort(np.unique(np.array(X_list)[np.array(plaquette_list_g)].reshape(-1))))
+            site_list_b = jnp.array(np.sort(np.unique(np.array(X_list)[np.array(plaquette_list_b)].reshape(-1))))
+
+            site_color_labels = np.full(N, -1, dtype=np.int8)
+            site_color_labels[np.array(site_list_r)] = 0
+            site_color_labels[np.array(site_list_g)] = 1
+            site_color_labels[np.array(site_list_b)] = 2
+            site_color_labels = jnp.array(site_color_labels)
+            n_unit_cell_colors = 3
 
             a = np.sort([X_list_r[-1].item(), X_list_g[-1].item(), X_list_b[-1].item()])
 
@@ -230,9 +271,13 @@ def update_globals():
             inverse_matrix = np.insert(inverse_matrix, [a[0], a[1]-1, a[2]-2], np.zeros((3, N)), axis=0)
 
         else:
+            X_list_r = X_list_g = X_list_b = None
 
             inverse_matrix = left_inverse_mod2(np.delete(transform_matrix,[N_plaquette-1], axis = -1))
             inverse_matrix = np.insert(inverse_matrix, [N_plaquette-1], np.zeros((1, N)), axis=0)
+
+        kernel2 = generate_mask(L**2, 2, L, plaquette_color_labels)
+        kernel3 = generate_mask(L**2, 3, L, plaquette_color_labels)
 
         coordinates = np.argwhere(inverse_matrix == 1)
 
