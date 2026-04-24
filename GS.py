@@ -2,10 +2,6 @@
 import os
 from pyexpat import features
 from re import L
-import sys# Kagome spin liquid
-import os
-from pyexpat import features
-from re import L
 import sys
 from traceback import print_list
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -23,6 +19,7 @@ import netket as nk
 # import netket_fidelity as nkf
 import netket.experimental as nkx
 import numpy as np
+import optax
 import random
 import shutil
 import functools
@@ -102,10 +99,15 @@ def parse_arguments():
     parser.add_argument('--hx-red', type=float, default=None, help='Additional X-field strength on red sites only')
     parser.add_argument('--hz-red', type=float, default=None, help='Additional Z-field strength on red sites only')
     parser.add_argument('--init-params', type=str, default='init_params_L6', help='Parameter file reloaded before each field value')
-    parser.add_argument('--n-chains', type=int, default=None, help='Number of MCMC chains')
-    parser.add_argument('--n-samples', type=int, default=None, help='Number of MC samples per iteration')
-    parser.add_argument('--chunk-size', type=int, default=None, help='Chunk size for model evaluation')
+    parser.add_argument('--n-chains', type=int, default=2**8, help='Number of MCMC chains')
+    parser.add_argument('--n-samples', type=int, default=2**13, help='Number of MC samples per iteration')
+    parser.add_argument('--chunk-size', type=int, default=2**14, help='Chunk size for model evaluation')
+    parser.add_argument('--n-features', type=int, default=12, help='Number of CNN feature channels')
+    parser.add_argument('--blur-sample-chunk', type=int, default=None, help='Chunk size over blurred source samples')
+    parser.add_argument('--blur-conn-chunk', type=int, default=None, help='Chunk size over connected configurations in blurred sampling')
     parser.add_argument('--n-discard-per-chain', type=int, default=10, help='Discarded samples per chain')
+    parser.add_argument('--pretrain-nstep', type=int, default=200, help='Number of mean-field pretraining steps')
+    parser.add_argument('--pretrain-dt', type=float, default=2.0, help='Total mean-field pretraining step')
     parser.add_argument('--nstep', type=int, default=300, help='Number of optimization steps')
     parser.add_argument('--dt', type=float, default=5.0, help='Total imaginary-time step')
     parser.add_argument('--show-progress', action='store_true', help='Show tqdm optimization progress')
@@ -123,7 +125,7 @@ def parse_arguments():
 
 
 def format_field_value(value):
-    return f"{value:+.6f}".replace("+", "p").replace("-", "m").replace(".", "p")
+    return f"{value:+.2f}".replace("+", "p").replace("-", "m").replace(".", "p")
 
 
 def build_output_paths(hx, hz, hx_red = None, hz_red = None):
@@ -194,27 +196,72 @@ def adapt_loaded_params(loaded_params, template_params):
     return traverse_util.unflatten_dict(adapted_flat)
 
 
-def get_mc_settings(args, use_small_pg):
-    n_chains = args.n_chains
-    n_samples = args.n_samples
-    chunk_size = args.chunk_size
+def build_vstate(sampler, use_small_pg, use_color_labels, chunk_size, n_samples, n_discard_per_chain, n_features, mean_field_only=False):
+    model = (
+        cnn.MeanField_symmetric(
+            rotation=True,
+            use_small_point_group=use_small_pg,
+            use_color_labels=use_color_labels,
+        )
+        if mean_field_only
+        else cnn.CNN_symmetric(
+            rotation=True,
+            use_small_point_group=use_small_pg,
+            use_color_labels=use_color_labels,
+            n_features=n_features,
+        )
+    )
+    return nk.vqs.MCState(
+        sampler,
+        model=model,
+        chunk_size=chunk_size,
+        n_samples=n_samples,
+        n_discard_per_chain=n_discard_per_chain,
+    )
 
-    if n_chains is None:
-        n_chains = 2**7 if use_small_pg else 2**8
-    if n_samples is None:
-        n_samples = 2**10 if use_small_pg else 2**12
-    if chunk_size is None:
-        chunk_size = 2**11 if use_small_pg else 2**14
 
-    chunk_size = min(chunk_size, n_samples)
-    return n_chains, n_samples, chunk_size
+def transplant_mean_fields(mean_field_params, full_params):
+    mean_field_params = flax.core.unfreeze(mean_field_params)
+    full_params = flax.core.unfreeze(full_params)
+
+    for key in ("mean_field0", "mean_field1"):
+        if key in mean_field_params:
+            full_params[key] = mean_field_params[key]
+
+    return full_params
+
+
+def run_netket_vmc(vstate, hamiltonian, n_iter, optimizer, log_path, show_progress, variance_stop_threshold=None):
+    sr = nk.optimizer.SR(
+        qgt=nk.optimizer.qgt.QGTJacobianDense,
+        diag_shift=1.0e-3,
+        mode="complex",
+    )
+    driver = nk.driver.VMC(
+        hamiltonian,
+        optimizer,
+        variational_state=vstate,
+        preconditioner=sr,
+    )
+    callback = lambda step, log_data, driver: True
+    if variance_stop_threshold is not None:
+        def callback(step, log_data, driver):
+            return float(jnp.real(driver.energy.Variance)) >= variance_stop_threshold
+
+    driver.run(
+        n_iter=n_iter,
+        out=log_path,
+        show_progress=show_progress,
+        callback=callback,
+    )
 
 def main():
     
     args = parse_arguments()
     use_small_pg = use_small_point_group(args)
     use_color_labels = use_small_pg
-    n_chains, n_samples, chunk_size = get_mc_settings(args, use_small_pg)
+    n_chains, n_samples, chunk_size = args.n_chains, args.n_samples, args.chunk_size
+    
     if use_small_pg and g.site_list_r is None:
         raise ValueError("Red-site fields require a 3-colorable lattice, i.e. L divisible by 3.")
     hi = nk.hilbert.Spin(s=1/2, N=g.N, inverted_ordering = False)
@@ -237,20 +284,7 @@ def main():
     rules =  cnn.Gauge_trans(0.5)
     sampler = nk.sampler.MetropolisSampler(hi, rules, sweep_size = 3 * g.N // 4, n_chains=n_chains, reset_chains=True, dtype=jnp.int64)
     os.makedirs("log_files", exist_ok=True)
-
-    vstate0 = nk.vqs.MCState(
-        sampler,
-        model = cnn.CNN_symmetric(
-            rotation = True,
-            use_small_point_group = use_small_pg,
-            use_color_labels = use_color_labels,
-        ),
-        chunk_size = chunk_size,
-        n_samples=n_samples,
-        n_discard_per_chain=args.n_discard_per_chain,
-    )
-    ha0 = cnn.Ruby_Hamiltonian(hi, -1, -1)
-    print(vstate0.n_parameters)
+    ha1 = cnn.Ruby_Hamiltonian(hi, -1, -1, use_cz_ring= True)
     print(f"MC settings: n_chains={n_chains}, n_samples={n_samples}, chunk_size={chunk_size}")
 
     field_values = get_sweep_values(args)
@@ -272,12 +306,7 @@ def main():
             print(f"Skipping hx={hx}, hz={hz}, hx_red={hx_red}, hz_red={hz_red}: found existing log {log_path}")
             continue
 
-        params = pickle.load(open(args.init_params, "rb"))
-        params = adapt_loaded_params(params, vstate0.parameters)
-        vstate0.parameters = jax.tree_util.tree_map(lambda x: x, params)
-
-        
-        ha = ha0 - hx * sum([sigmax(hi, i) for i in range(g.N)]) 
+        ha = ha1 - hx * sum([sigmax(hi, i) for i in range(g.N)]) 
         ha += -hz * sum([sigmaz(hi, i) for i in range(g.N)])
         if hx_red is not None:
             ha += -hx_red * sum([sigmax(hi, int(i)) for i in np.array(g.site_list_r)])
@@ -285,123 +314,87 @@ def main():
             ha += -hz_red * sum([sigmaz(hi, int(i)) for i in np.array(g.site_list_r)])
 
         print(f"Running hx={hx}, hz={hz}, hx_red={hx_red}, hz_red={hz_red}, small_pg={use_small_pg}")
+        mean_field_vstate = build_vstate(
+            sampler,
+            use_small_pg,
+            use_color_labels,
+            chunk_size,
+            n_samples,
+            args.n_discard_per_chain,
+            args.n_features,
+            mean_field_only=True,
+        )
+        print(f"Mean-field parameters: {mean_field_vstate.n_parameters}")
+        print(mean_field_vstate.expect(ha))
+
+        # cnn.evolve(
+        #     mean_field_vstate,
+        #     ha,
+        #     args.pretrain_nstep,
+        #     args.pretrain_dt,
+        #     None,
+        #     show_progress=args.show_progress,
+        #     log_path=log_path + "_pretrain",
+        # )
+        run_netket_vmc(
+            mean_field_vstate,
+            ha,
+            args.pretrain_nstep,
+            nk.optimizer.Sgd(learning_rate=abs(args.pretrain_dt / max(args.pretrain_nstep, 1))),
+            None,
+            args.show_progress,
+            variance_stop_threshold=40.0,
+        )
+
+        vstate0 = build_vstate(
+            sampler,
+            use_small_pg,
+            use_color_labels,
+            chunk_size,
+            n_samples,
+            args.n_discard_per_chain,
+            args.n_features,
+            mean_field_only=False,
+        )
+        print(f"Full-model parameters: {vstate0.n_parameters}")
+        vstate0.parameters = jax.tree_util.tree_map(
+            lambda x: x,
+            transplant_mean_fields(mean_field_vstate.parameters, vstate0.parameters),
+        )
+
+        del mean_field_vstate
+        gc.collect()
+
         print(vstate0.expect(ha))
         cnn.evolve(
             vstate0,
             ha,
             args.nstep,
             args.dt,
-            [0, vstate0.n_parameters],
+            None,
             show_progress=args.show_progress,
             log_path=log_path,
         )
+        # second_stage_base_lr = abs(args.dt / max(args.nstep, 1))
+        # second_stage_schedule = optax.piecewise_constant_schedule(
+        #     init_value=0.1 * second_stage_base_lr,
+        #     boundaries_and_scales={max(args.nstep // 2, 1): 10.0},
+        # )
+        # second_stage_optimizer = optax.adamw(
+        #     learning_rate=second_stage_schedule,
+        #     weight_decay=1.0e-4,
+        # )
+        # run_netket_vmc(
+        #     vstate0,
+        #     ha,
+        #     args.nstep,
+        #     second_stage_optimizer,
+        #     log_path,
+        #     args.show_progress,
+        # )
         pickle.dump(vstate0.parameters, open(params_path, "wb"))
         print(f"Saved optimized parameters to {params_path}")
 
-        
-if __name__ == "__main__":
-    main()
-
-from traceback import print_list
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-import jax
-os.environ["JAX_PLATFORM_NAME"] = "gpu"
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "platform"
-os.environ["nk.config.netket_experimental_disable_ode_jit"] = "True"
-os.environ["NETKET_EXPERIMENTAL_FFT_AUTOCORRELATION"] = "True"
-
-from copy import copy
-import json
-import time
-import math
-import netket as nk
-# import netket_fidelity as nkf
-import netket.experimental as nkx
-import numpy as np
-import random
-import shutil
-import functools
-
-from netket.operator.spin import sigmax, sigmaz, sigmay, identity
-import jax.numpy as jnp
-import scipy
-import jax.tree_util
-from matplotlib import pyplot as plt
-import pickle 
-
-import flax
-from flax import struct
-import flax.linen as nn
-import netket.nn as nknn
-from flax import traverse_util
-from flax.core import freeze
-import qutip as qtp
-from tqdm import tqdm
-import time
-
-from typing import Any, Optional, Tuple
-from netket.utils.types import PyTree, PRNGKeyT
-from netket.sampler import MetropolisRule
-from netket.stats import statistics as mpi_statistics
-from functools import partial
-import cnn
-import global_vars as g
-import gc
-
-
-import argparse
-def parse_arguments():
-    parser = argparse.ArgumentParser(description='Process some global variables.')
-    parser.add_argument('--L', type=int, required=True, help='Value for L')\
-
-    args = parser.parse_args()
-    g.L = args.L
-    g.update_globals()
-    return args
-
-def main():
-    
-    args = parse_arguments()
-    hi = nk.hilbert.Spin(s=1/2, N=g.N, inverted_ordering = False)
-    print(args, g.N)
-
-    @nk.hilbert.random.random_state.dispatch
-    def random_state(hilb : nk.hilbert.Spin, key, size : int, *, dtype):
-        out = jnp.ones((size, g.N), dtype = dtype)
-        rs = jax.random.randint(key, shape=(size, g.transform_matrix.shape[1]), minval= 0, maxval= 2)
-        @jax.vmap
-        def flip(sigma, index):
-            b = g.transform_matrix @ index % 2
-            s = sigma * (-1) ** b
-            return s.astype(dtype)
-        
-        outp = flip(out, rs)
-        return outp
-    
-
-    ha = cnn.Ruby_Hamiltonian(hi, -1, -1)
-    ha += -0.2 * sum([sigmax(hi, i) for i in range(g.N)]) 
-    ha += -0.2 * sum([sigmaz(hi, i) for i in range(g.N)])
-
-    rules =  cnn.Gauge_trans(0.5)
-    sampler = nk.sampler.MetropolisSampler(hi, rules, sweep_size = 3 * g.N // 4, n_chains=2**8, reset_chains=True, dtype=jnp.int64)
-    # eig_val, eig_vec = ha.to_qobj().groundstate(sparse = True)
-    # print(eig_val)
-
-    s = hi.random_state(size = 10, key = jax.random.PRNGKey(0))
-
-    Bp = cnn.Ruby_Hamiltonian(hi, 0, 1/(g.N_plaquette)) 
-
-    vstate0 = nk.vqs.MCState(sampler, model = cnn.CNN_symmetric(rotation = True), chunk_size = 2**14, n_samples=2**11, n_discard_per_chain=10)
-
-    # params = pickle.load(open("init_params_L6","rb"))
-    # vstate0.parameters = jax.tree_util.tree_map(lambda x: x, params)
-    print(vstate0.n_parameters)
-    print(vstate0.expect(ha))
-    cnn.evolve(vstate0, ha, 300, 5.0, [0, vstate0.n_parameters], op = Bp, show_progress = True)
-    params = flax.core.copy(vstate0.parameters)
-
-    # pickle.dump(vstate0.parameters, open("init_params_L6_perturbed", "wb"))
         
 if __name__ == "__main__":
     main()
