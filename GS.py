@@ -1,55 +1,25 @@
-# Kagome spin liquid
 import os
-from pyexpat import features
-from re import L
-import sys
-from traceback import print_list
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-import jax
 os.environ["JAX_PLATFORM_NAME"] = "gpu"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "platform"
 os.environ["nk.config.netket_experimental_disable_ode_jit"] = "True"
 os.environ["NETKET_EXPERIMENTAL_FFT_AUTOCORRELATION"] = "True"
 
-from copy import copy
-import json
-import time
-import math
-import netket as nk
-# import netket_fidelity as nkf
-import netket.experimental as nkx
-import numpy as np
-import optax
-import random
-import shutil
-import functools
-
-from netket.operator.spin import sigmax, sigmaz, sigmay, identity
-import jax.numpy as jnp
-import scipy
-import jax.tree_util
-from matplotlib import pyplot as plt
-import pickle 
+import argparse
+import pickle
 
 import flax
-from flax import struct
-import flax.linen as nn
-import netket.nn as nknn
+import jax
+import jax.numpy as jnp
+import netket as nk
+import numpy as np
 from flax import traverse_util
-from flax.core import freeze
-import qutip as qtp
-from tqdm import tqdm
-import time
 
-from typing import Any, Optional, Tuple
-from netket.utils.types import PyTree, PRNGKeyT
-from netket.sampler import MetropolisRule
-from netket.stats import statistics as mpi_statistics
-from functools import partial
+from netket.operator.spin import sigmax, sigmaz
+
 import cnn
 import global_vars as g
-import gc
-
 
 def _patch_numpy_asarray_copy_kw():
     try:
@@ -85,7 +55,6 @@ def _patch_jax_named_shape_pickle():
 _patch_jax_named_shape_pickle()
 
 
-import argparse
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Process some global variables.')
     parser.add_argument('--L', type=int, required=True, help='Value for L')
@@ -102,17 +71,25 @@ def parse_arguments():
     parser.add_argument('--n-chains', type=int, default=2**8, help='Number of MCMC chains')
     parser.add_argument('--n-samples', type=int, default=2**13, help='Number of MC samples per iteration')
     parser.add_argument('--chunk-size', type=int, default=2**14, help='Chunk size for model evaluation')
-    parser.add_argument('--n-features', type=int, default=12, help='Number of CNN feature channels')
-    parser.add_argument('--blur-sample-chunk', type=int, default=None, help='Chunk size over blurred source samples')
-    parser.add_argument('--blur-conn-chunk', type=int, default=None, help='Chunk size over connected configurations in blurred sampling')
+    parser.add_argument('--n-features', type=int, default=6, help='Number of CNN feature channels')
+    parser.add_argument('--n-layers', type=int, default=2, help='Number of CNN convolution layers in the full model')
+    parser.add_argument('--pretrain-n-features', type=int, default=None, help='Number of CNN feature channels in the first training stage (default: half of --n-features)')
     parser.add_argument('--n-discard-per-chain', type=int, default=10, help='Discarded samples per chain')
-    parser.add_argument('--pretrain-nstep', type=int, default=200, help='Number of mean-field pretraining steps')
-    parser.add_argument('--pretrain-dt', type=float, default=2.0, help='Total mean-field pretraining step')
-    parser.add_argument('--nstep', type=int, default=300, help='Number of optimization steps')
-    parser.add_argument('--dt', type=float, default=5.0, help='Total imaginary-time step')
+    parser.add_argument('--pretrain-nstep', type=int, default=150, help='Number of first-stage CNN training steps')
+    parser.add_argument('--pretrain-dt', type=float, default=2.5, help='Total imaginary-time step used in the first CNN stage')
+    parser.add_argument('--nstep', type=int, default=600, help='Number of optimization steps')
+    parser.add_argument('--dt', type=float, default=10, help='Total imaginary-time step')
     parser.add_argument('--show-progress', action='store_true', help='Show tqdm optimization progress')
 
     args = parser.parse_args()
+    if args.n_features < 1:
+        parser.error('--n-features must be at least 1.')
+    if args.n_layers < 1:
+        parser.error('--n-layers must be at least 1.')
+    if args.pretrain_n_features is not None and args.pretrain_n_features < 1:
+        parser.error('--pretrain-n-features must be at least 1.')
+    if args.pretrain_nstep < 0:
+        parser.error('--pretrain-nstep must be non-negative.')
     if args.field_axis is None:
         has_explicit_sweep = args.field_values is not None or any(
             value is not None for value in (args.field_start, args.field_stop, args.field_num)
@@ -128,13 +105,15 @@ def format_field_value(value):
     return f"{value:+.2f}".replace("+", "p").replace("-", "m").replace(".", "p")
 
 
-def build_output_paths(hx, hz, hx_red = None, hz_red = None):
+def build_output_paths(field_axis, hx, hz, hx_red=None, hz_red=None):
     suffix = f"hx_{format_field_value(hx)}_hz_{format_field_value(hz)}"
     if hx_red is not None:
         suffix += f"_hx_red_{format_field_value(hx_red)}"
     if hz_red is not None:
         suffix += f"_hz_red_{format_field_value(hz_red)}"
-    return os.path.join("log_files", f"log_data_L6_{suffix}"), f"params_L6_{suffix}"
+    axis_suffix = "single" if field_axis is None else field_axis
+    params_dir = f"params_sweep_{axis_suffix}"
+    return os.path.join("log_files", f"log_data_L6_{suffix}"), os.path.join(params_dir, f"params_L6_{suffix}")
 
 
 def get_sweep_values(args):
@@ -163,53 +142,68 @@ def use_small_point_group(args):
     return args.hx_red is not None or args.hz_red is not None or args.field_axis in ('x_red', 'z_red')
 
 
-def lift_conv_params(old_value, target_value):
+TRANSFER_INIT_SCALE = 0.05
+
+
+def _param_base_like(target_value, scale=1.0):
+    return scale * jnp.array(target_value, dtype=target_value.dtype)
+
+
+def lift_conv_params(old_value, target_value, scale=1.0):
     if old_value.shape == target_value.shape:
         return old_value.astype(target_value.dtype)
 
-    if (
-        len(target_value.shape) == len(old_value.shape) + 1
-        and target_value.shape[1:] == old_value.shape
-        and target_value.shape[0] == g.n_unit_cell_colors
-    ):
-        expanded = jnp.stack([old_value] * g.n_unit_cell_colors, axis=0)
-        return expanded.astype(target_value.dtype)
+    def copy_overlap(source, target):
+        slices = tuple(slice(0, min(source.shape[i], target.shape[i])) for i in range(source.ndim))
+        return target.at[slices].set(source[slices])
+
+    adapted = _param_base_like(target_value, scale=scale)
+
+    if len(target_value.shape) == len(old_value.shape):
+        return copy_overlap(old_value.astype(target_value.dtype), adapted)
+
+    if len(target_value.shape) == len(old_value.shape) + 1 and target_value.shape[0] == g.n_unit_cell_colors:
+        expanded = jnp.stack([old_value] * g.n_unit_cell_colors, axis=0).astype(target_value.dtype)
+        return copy_overlap(expanded, adapted)
 
     raise ValueError(f"Cannot adapt parameter shape {old_value.shape} to {target_value.shape}")
 
 
-def adapt_loaded_params(loaded_params, template_params):
+def adapt_loaded_params(loaded_params, template_params, missing_scale=1.0):
     loaded_flat = traverse_util.flatten_dict(flax.core.unfreeze(loaded_params))
     template_flat = traverse_util.flatten_dict(flax.core.unfreeze(template_params))
     adapted_flat = {}
 
     for key, target_value in template_flat.items():
         if key not in loaded_flat:
-            raise KeyError(f"Missing parameter {key} in loaded parameter tree")
+            adapted_flat[key] = _param_base_like(target_value, scale=missing_scale)
+            continue
 
         old_value = loaded_flat[key]
         if hasattr(old_value, "shape") and hasattr(target_value, "shape"):
-            adapted_flat[key] = lift_conv_params(old_value, target_value)
+            adapted_flat[key] = lift_conv_params(old_value, target_value, scale=missing_scale)
         else:
             adapted_flat[key] = old_value
 
     return traverse_util.unflatten_dict(adapted_flat)
 
 
-def build_vstate(sampler, use_small_pg, use_color_labels, chunk_size, n_samples, n_discard_per_chain, n_features, mean_field_only=False):
-    model = (
-        cnn.MeanField_symmetric(
-            rotation=True,
-            use_small_point_group=use_small_pg,
-            use_color_labels=use_color_labels,
-        )
-        if mean_field_only
-        else cnn.CNN_symmetric(
-            rotation=True,
-            use_small_point_group=use_small_pg,
-            use_color_labels=use_color_labels,
-            n_features=n_features,
-        )
+def build_vstate(
+    sampler,
+    use_small_pg,
+    use_color_labels,
+    chunk_size,
+    n_samples,
+    n_discard_per_chain,
+    n_features,
+    n_layers,
+):
+    model = cnn.CNN_symmetric(
+        rotation=True,
+        use_small_point_group=use_small_pg,
+        use_color_labels=use_color_labels,
+        n_features=n_features,
+        n_layers=n_layers,
     )
     return nk.vqs.MCState(
         sampler,
@@ -220,47 +214,32 @@ def build_vstate(sampler, use_small_pg, use_color_labels, chunk_size, n_samples,
     )
 
 
-def transplant_mean_fields(mean_field_params, full_params):
-    mean_field_params = flax.core.unfreeze(mean_field_params)
-    full_params = flax.core.unfreeze(full_params)
+def load_params_if_available(path):
+    if path is None or not os.path.exists(path):
+        return None
 
-    for key in ("mean_field0", "mean_field1"):
-        if key in mean_field_params:
-            full_params[key] = mean_field_params[key]
-
-    return full_params
+    with open(path, "rb") as handle:
+        return pickle.load(handle)
 
 
-def run_netket_vmc(vstate, hamiltonian, n_iter, optimizer, log_path, show_progress, variance_stop_threshold=None):
-    sr = nk.optimizer.SR(
-        qgt=nk.optimizer.qgt.QGTJacobianDense,
-        diag_shift=1.0e-3,
-        mode="complex",
-    )
-    driver = nk.driver.VMC(
-        hamiltonian,
-        optimizer,
-        variational_state=vstate,
-        preconditioner=sr,
-    )
-    callback = lambda step, log_data, driver: True
-    if variance_stop_threshold is not None:
-        def callback(step, log_data, driver):
-            return float(jnp.real(driver.energy.Variance)) >= variance_stop_threshold
+def initialize_vstate_params(vstate, loaded_params):
+    if loaded_params is None:
+        return
+    vstate.parameters = adapt_loaded_params(loaded_params, vstate.parameters)
 
-    driver.run(
-        n_iter=n_iter,
-        out=log_path,
-        show_progress=show_progress,
-        callback=callback,
-    )
+
+def get_pretrain_n_features(args):
+    if args.pretrain_n_features is not None:
+        return args.pretrain_n_features
+    return max(1, args.n_features // 2)
 
 def main():
-    
     args = parse_arguments()
     use_small_pg = use_small_point_group(args)
     use_color_labels = use_small_pg
     n_chains, n_samples, chunk_size = args.n_chains, args.n_samples, args.chunk_size
+    pretrain_n_features = get_pretrain_n_features(args)
+    pretrain_n_layers = 1
     
     if use_small_pg and g.site_list_r is None:
         raise ValueError("Red-site fields require a 3-colorable lattice, i.e. L divisible by 3.")
@@ -285,6 +264,7 @@ def main():
     sampler = nk.sampler.MetropolisSampler(hi, rules, sweep_size = 3 * g.N // 4, n_chains=n_chains, reset_chains=True, dtype=jnp.int64)
     os.makedirs("log_files", exist_ok=True)
     ha1 = cnn.Ruby_Hamiltonian(hi, -1, -1, use_cz_ring= True)
+    As = cnn.Ruby_Hamiltonian(hi, 0, 1/g.N_plaquette, use_cz_ring= True)
     print(f"MC settings: n_chains={n_chains}, n_samples={n_samples}, chunk_size={chunk_size}")
 
     field_values = get_sweep_values(args)
@@ -301,10 +281,9 @@ def main():
         elif args.field_axis == 'z_red':
             hz_red = field_value
 
-        log_path, params_path = build_output_paths(hx, hz, hx_red, hz_red)
-        if os.path.exists(log_path):
-            print(f"Skipping hx={hx}, hz={hz}, hx_red={hx_red}, hz_red={hz_red}: found existing log {log_path}")
-            continue
+        log_path, params_path = build_output_paths(args.field_axis, hx, hz, hx_red, hz_red)
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        os.makedirs(os.path.dirname(params_path), exist_ok=True)
 
         ha = ha1 - hx * sum([sigmax(hi, i) for i in range(g.N)]) 
         ha += -hz * sum([sigmaz(hi, i) for i in range(g.N)])
@@ -314,37 +293,38 @@ def main():
             ha += -hz_red * sum([sigmaz(hi, int(i)) for i in np.array(g.site_list_r)])
 
         print(f"Running hx={hx}, hz={hz}, hx_red={hx_red}, hz_red={hz_red}, small_pg={use_small_pg}")
-        mean_field_vstate = build_vstate(
+        loaded_params = load_params_if_available(args.init_params)
+        if loaded_params is not None:
+            print(f"Loaded initial parameters from {args.init_params}")
+
+        pretrain_vstate = build_vstate(
             sampler,
             use_small_pg,
             use_color_labels,
             chunk_size,
             n_samples,
             args.n_discard_per_chain,
-            args.n_features,
-            mean_field_only=True,
+            pretrain_n_features,
+            pretrain_n_layers,
         )
-        print(f"Mean-field parameters: {mean_field_vstate.n_parameters}")
-        print(mean_field_vstate.expect(ha))
+        initialize_vstate_params(pretrain_vstate, loaded_params)
+        print(
+            f"Stage 1 CNN parameters: {pretrain_vstate.n_parameters} "
+            f"(features={pretrain_n_features}, layers={pretrain_n_layers})"
+        )
+        print(pretrain_vstate.expect(ha))
 
-        # cnn.evolve(
-        #     mean_field_vstate,
-        #     ha,
-        #     args.pretrain_nstep,
-        #     args.pretrain_dt,
-        #     None,
-        #     show_progress=args.show_progress,
-        #     log_path=log_path + "_pretrain",
-        # )
-        run_netket_vmc(
-            mean_field_vstate,
-            ha,
-            args.pretrain_nstep,
-            nk.optimizer.Sgd(learning_rate=abs(args.pretrain_dt / max(args.pretrain_nstep, 1))),
-            None,
-            args.show_progress,
-            variance_stop_threshold=40.0,
-        )
+        if args.pretrain_nstep > 0:
+            cnn.evolve(
+                pretrain_vstate,
+                ha,
+                args.pretrain_nstep,
+                args.pretrain_dt,
+                None,
+                show_progress=args.show_progress,
+                log_path=f"{log_path}_stage1",
+                op=As,
+            )
 
         vstate0 = build_vstate(
             sampler,
@@ -354,17 +334,17 @@ def main():
             n_samples,
             args.n_discard_per_chain,
             args.n_features,
-            mean_field_only=False,
+            args.n_layers,
         )
-        print(f"Full-model parameters: {vstate0.n_parameters}")
-        vstate0.parameters = jax.tree_util.tree_map(
-            lambda x: x,
-            transplant_mean_fields(mean_field_vstate.parameters, vstate0.parameters),
+        vstate0.parameters = adapt_loaded_params(
+            pretrain_vstate.parameters,
+            vstate0.parameters,
+            missing_scale=TRANSFER_INIT_SCALE,
         )
-
-        del mean_field_vstate
-        gc.collect()
-
+        print(
+            f"Stage 2 CNN parameters: {vstate0.n_parameters} "
+            f"(features={args.n_features}, layers={args.n_layers})"
+        )
         print(vstate0.expect(ha))
         cnn.evolve(
             vstate0,
@@ -374,25 +354,10 @@ def main():
             None,
             show_progress=args.show_progress,
             log_path=log_path,
+            op = As,
         )
-        # second_stage_base_lr = abs(args.dt / max(args.nstep, 1))
-        # second_stage_schedule = optax.piecewise_constant_schedule(
-        #     init_value=0.1 * second_stage_base_lr,
-        #     boundaries_and_scales={max(args.nstep // 2, 1): 10.0},
-        # )
-        # second_stage_optimizer = optax.adamw(
-        #     learning_rate=second_stage_schedule,
-        #     weight_decay=1.0e-4,
-        # )
-        # run_netket_vmc(
-        #     vstate0,
-        #     ha,
-        #     args.nstep,
-        #     second_stage_optimizer,
-        #     log_path,
-        #     args.show_progress,
-        # )
-        pickle.dump(vstate0.parameters, open(params_path, "wb"))
+        with open(params_path, "wb") as handle:
+            pickle.dump(vstate0.parameters, handle)
         print(f"Saved optimized parameters to {params_path}")
 
         
