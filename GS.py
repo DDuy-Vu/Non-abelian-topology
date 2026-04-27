@@ -72,7 +72,7 @@ def parse_arguments():
     parser.add_argument('--n-samples', type=int, default=2**13, help='Number of MC samples per iteration')
     parser.add_argument('--chunk-size', type=int, default=2**14, help='Chunk size for model evaluation')
     parser.add_argument('--n-features', type=int, default=6, help='Number of CNN feature channels')
-    parser.add_argument('--n-layers', type=int, default=2, help='Number of CNN convolution layers in the full model')
+    parser.add_argument('--n-layers', type=int, default=3, help='Number of CNN convolution layers in the full model')
     parser.add_argument('--pretrain-n-features', type=int, default=None, help='Number of CNN feature channels in the first training stage (default: half of --n-features)')
     parser.add_argument('--n-discard-per-chain', type=int, default=10, help='Discarded samples per chain')
     parser.add_argument('--pretrain-nstep', type=int, default=150, help='Number of first-stage CNN training steps')
