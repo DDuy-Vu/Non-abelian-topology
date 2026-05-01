@@ -39,6 +39,10 @@ NetKetSpin = None
 class NonFiniteStepError(ValueError):
     """Raised when one attempted evolution substep produces non-finite data."""
 
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.details = details or {}
+
 
 class _InterruptedForRequeue(Exception):
     def __init__(self, signum: int):
@@ -238,6 +242,294 @@ def _append_diagnostic(log_path: Path, event: str, *, started_at: float | None =
     if started_at is not None:
         record["elapsed_seconds"] = now - started_at
     _append_jsonl(log_path, record)
+
+
+def _finite_float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if np.isfinite(out) else None
+
+
+def _stats_mean_real(stats_payload: dict[str, Any] | None) -> float | None:
+    if not isinstance(stats_payload, dict):
+        return None
+    for key in ("mean", "Mean"):
+        value = stats_payload.get(key)
+        if isinstance(value, dict):
+            return _finite_float_or_none(value.get("real"))
+        finite = _finite_float_or_none(value)
+        if finite is not None:
+            return finite
+    return None
+
+
+def _array_nonfinite_counts(value: Any) -> dict[str, int]:
+    arr = np.asarray(value)
+    if arr.dtype.kind in {"U", "S", "O"}:
+        return {
+            "size": int(arr.size),
+            "nan_count": 0,
+            "inf_count": 0,
+            "nonfinite_count": 0,
+        }
+    nan_mask = np.isnan(arr)
+    inf_mask = np.isinf(arr)
+    nonfinite_mask = ~np.isfinite(arr)
+    return {
+        "size": int(arr.size),
+        "nan_count": int(nan_mask.sum()),
+        "inf_count": int(inf_mask.sum()),
+        "nonfinite_count": int(nonfinite_mask.sum()),
+    }
+
+
+def _merge_nonfinite_counts(target: dict[str, Any], counts: dict[str, int]) -> None:
+    target["size"] += int(counts.get("size", 0))
+    target["nan_count"] += int(counts.get("nan_count", 0))
+    target["inf_count"] += int(counts.get("inf_count", 0))
+    target["nonfinite_count"] += int(counts.get("nonfinite_count", 0))
+
+
+def _stats_nonfinite_counts(stats) -> dict[str, Any]:
+    out = {
+        "attributes": {},
+        "size": 0,
+        "nan_count": 0,
+        "inf_count": 0,
+        "nonfinite_count": 0,
+    }
+    if stats is None:
+        return out
+    attr_groups = (
+        ("mean", "Mean"),
+        ("variance", "Variance"),
+        ("error_of_mean", "Sigma"),
+        ("R_hat",),
+        ("tau_corr",),
+    )
+    for attr_group in attr_groups:
+        attr = next((name for name in attr_group if hasattr(stats, name)), None)
+        if attr is None:
+            continue
+        counts = _array_nonfinite_counts(getattr(stats, attr))
+        out["attributes"][attr] = counts
+        _merge_nonfinite_counts(out, counts)
+    return out
+
+
+def _payload_nonfinite_counts(stats_payload: dict[str, Any] | None) -> dict[str, int]:
+    counts = {
+        "size": 0,
+        "nan_count": 0,
+        "inf_count": 0,
+        "nonfinite_count": 0,
+    }
+    if not isinstance(stats_payload, dict):
+        return counts
+    summary = stats_payload.get("nonfinite_counts")
+    if isinstance(summary, dict):
+        return {
+            "size": int(summary.get("size", 0)),
+            "nan_count": int(summary.get("nan_count", 0)),
+            "inf_count": int(summary.get("inf_count", 0)),
+            "nonfinite_count": int(summary.get("nonfinite_count", 0)),
+        }
+    if "mean" in stats_payload or "Mean" in stats_payload:
+        if _stats_mean_real(stats_payload) is None:
+            return {
+                "size": 1,
+                "nan_count": 0,
+                "inf_count": 0,
+                "nonfinite_count": 1,
+            }
+    return counts
+
+
+def _record_energy_nonfinite_counts(record: dict[str, Any] | None) -> dict[str, int]:
+    if not isinstance(record, dict) or "energy" not in record:
+        return {
+            "size": 0,
+            "nan_count": 0,
+            "inf_count": 0,
+            "nonfinite_count": 0,
+        }
+    return _payload_nonfinite_counts(record.get("energy"))
+
+
+def _tree_nonfinite_counts(tree) -> dict[str, int]:
+    leaves = []
+
+    def collect(x):
+        leaves.append(np.asarray(x))
+        return x
+
+    import jax
+
+    jax.tree_util.tree_map(collect, tree)
+    out = {
+        "leaf_count": len(leaves),
+        "bad_leaf_count": 0,
+        "size": 0,
+        "nan_count": 0,
+        "inf_count": 0,
+        "nonfinite_count": 0,
+    }
+    for leaf in leaves:
+        counts = _array_nonfinite_counts(leaf)
+        out["size"] += counts["size"]
+        out["nan_count"] += counts["nan_count"]
+        out["inf_count"] += counts["inf_count"]
+        out["nonfinite_count"] += counts["nonfinite_count"]
+        if counts["nonfinite_count"]:
+            out["bad_leaf_count"] += 1
+    return out
+
+
+def _emit_workflow_warning(
+    *,
+    code: str,
+    logs: dict[str, Path],
+    metadata: dict[str, Any],
+    severity: str,
+    started_at: float,
+    **payload,
+) -> dict[str, Any]:
+    warning = {
+        "code": code,
+        "severity": severity,
+        "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "time_epoch": time.time(),
+        **payload,
+    }
+    warnings = metadata.setdefault("warnings", [])
+    warnings.append(warning)
+    metadata["warning_count"] = len(warnings)
+    metadata["health_status"] = "warning"
+    _append_diagnostic(
+        logs["diagnostics_log"],
+        "workflow_warning",
+        started_at=started_at,
+        **warning,
+    )
+    return warning
+
+
+def _update_stage_health_counters(stage_meta: dict[str, Any], record: dict[str, Any]) -> None:
+    if record.get("accepted", True):
+        stage_meta["accepted_iterations"] = int(stage_meta.get("accepted_iterations", 0)) + 1
+        stage_meta["consecutive_skipped_iterations"] = 0
+        return
+
+    stage_meta["skipped_iterations"] = int(stage_meta.get("skipped_iterations", 0)) + 1
+    stage_meta["consecutive_skipped_iterations"] = int(stage_meta.get("consecutive_skipped_iterations", 0)) + 1
+    skip_reasons = stage_meta.setdefault("skip_reasons", {})
+    reason = str(record.get("skip_reason", "unknown"))
+    skip_reasons[reason] = int(skip_reasons.get(reason, 0)) + 1
+
+
+def _emit_iteration_nonfinite_warnings(
+    *,
+    logs: dict[str, Path],
+    metadata: dict[str, Any],
+    record: dict[str, Any],
+    stage_meta: dict[str, Any],
+    started_at: float,
+) -> None:
+    completed = int(stage_meta.get("completed_iterations", 0))
+    skipped = int(stage_meta.get("skipped_iterations", 0))
+    consecutive = int(stage_meta.get("consecutive_skipped_iterations", 0))
+
+    if not record.get("accepted", True):
+        if record.get("skip_reason") == "nan_update_k2":
+            step_name = "step2"
+        elif record.get("skip_reason") == "nonfinite_update_k2":
+            step_name = "step2"
+        else:
+            step_name = "step1"
+        step_info = record.get(step_name, {})
+        _emit_workflow_warning(
+            code="nonfinite_update_skipped",
+            logs=logs,
+            metadata=metadata,
+            severity="warning",
+            started_at=started_at,
+            source="canonical_skipped_update",
+            stage=record.get("stage"),
+            phase_iteration=record.get("phase_iteration"),
+            completed_iterations=completed,
+            skipped_iterations=skipped,
+            consecutive_skipped_iterations=consecutive,
+            skip_reason=record.get("skip_reason"),
+            step=step_name,
+            update_size=step_info.get("update_size"),
+            update_nan_count=step_info.get("update_nan_count"),
+            update_inf_count=step_info.get("update_inf_count"),
+            update_nonfinite_count=step_info.get("update_nonfinite_count"),
+            skip_reasons=stage_meta.get("skip_reasons", {}),
+        )
+
+    for retry_event in record.get("retry_events", []):
+        _emit_workflow_warning(
+            code="nonfinite_substep_retried",
+            logs=logs,
+            metadata=metadata,
+            severity="warning",
+            started_at=started_at,
+            source="adaptive_substep_retry",
+            stage=record.get("stage"),
+            phase_iteration=record.get("phase_iteration"),
+            completed_iterations=completed,
+            attempt=retry_event.get("attempt"),
+            next_step_size=retry_event.get("next_step_size"),
+            error=retry_event.get("error"),
+            details=retry_event.get("details", {}),
+        )
+
+    energy_counts = _record_energy_nonfinite_counts(record)
+    if record.get("accepted", True) and energy_counts["nonfinite_count"]:
+        _emit_workflow_warning(
+            code="accepted_nonfinite_energy",
+            logs=logs,
+            metadata=metadata,
+            severity="error",
+            started_at=started_at,
+            stage=record.get("stage"),
+            phase_iteration=record.get("phase_iteration"),
+            completed_iterations=completed,
+            energy_nonfinite_counts=energy_counts,
+            energy=record.get("energy"),
+        )
+
+
+def _emit_stage_completion_warnings(
+    *,
+    logs: dict[str, Path],
+    metadata: dict[str, Any],
+    stage_meta: dict[str, Any],
+    stage_name: str,
+    started_at: float,
+) -> None:
+    last_record = stage_meta.get("last_record")
+    energy_counts = _record_energy_nonfinite_counts(last_record)
+    if energy_counts["nonfinite_count"]:
+        _emit_workflow_warning(
+            code="nonfinite_stage_final_energy",
+            logs=logs,
+            metadata=metadata,
+            severity="error",
+            started_at=started_at,
+            stage=stage_name,
+            phase_iteration=(last_record or {}).get("phase_iteration"),
+            completed_iterations=stage_meta.get("completed_iterations"),
+            skipped_iterations=stage_meta.get("skipped_iterations", 0),
+            consecutive_skipped_iterations=stage_meta.get("consecutive_skipped_iterations", 0),
+            energy_nonfinite_counts=energy_counts,
+            energy=(last_record or {}).get("energy"),
+        )
 
 
 def _is_truthy(value: Any) -> bool:
@@ -628,31 +920,17 @@ def _stats_payload(stats) -> dict[str, Any]:
     for attr in ("mean", "Mean", "variance", "Variance", "error_of_mean", "Sigma", "R_hat", "tau_corr"):
         if hasattr(stats, attr):
             payload[attr] = _json_value(getattr(stats, attr))
+    payload["nonfinite_counts"] = _stats_nonfinite_counts(stats)
     return payload
 
 
 def _stats_are_finite(stats) -> bool:
-    payload = _stats_payload(stats)
-    for key in ("mean", "Mean", "variance", "Variance", "error_of_mean", "Sigma"):
-        if key not in payload:
-            continue
-        value = np.asarray(payload[key])
-        if value.dtype.kind not in {"U", "S", "O"} and not np.all(np.isfinite(value)):
-            return False
-    return True
+    counts = _stats_nonfinite_counts(stats)
+    return not counts["nonfinite_count"]
 
 
 def _tree_has_nonfinite(tree) -> bool:
-    leaves = []
-
-    def collect(x):
-        leaves.append(np.asarray(x))
-        return x
-
-    import jax
-
-    jax.tree_util.tree_map(collect, tree)
-    return any(arr.dtype.kind not in {"U", "S", "O"} and not np.all(np.isfinite(arr)) for arr in leaves)
+    return _tree_nonfinite_counts(tree)["nonfinite_count"] > 0
 
 
 def _regularized_eigensolve(matrix, vector, *, jnp) -> Any:
@@ -842,7 +1120,10 @@ def _sr_direction(
         break
 
     if energy_stats is None or delta_energy is None or not _stats_are_finite(energy_stats):
-        raise NonFiniteStepError("Encountered non-finite local energy statistics.")
+        raise NonFiniteStepError(
+            "Encountered non-finite local energy statistics.",
+            details={"source": "local_energy_statistics", "energy": _stats_payload(energy_stats)},
+        )
 
     if _is_truthy(blurred_sampling_settings.get("enabled")):
         _, _, Sd, force = _blurred_sr_matrix_and_rhs(
@@ -862,15 +1143,23 @@ def _sr_direction(
     update_index = _regularized_eigensolve(Sd, force, jnp=jnp)
 
     update_index_array = np.asarray(update_index)
-    if not np.all(np.isfinite(update_index_array)):
-        raise NonFiniteStepError("Encountered non-finite SR update.")
+    update_counts = _array_nonfinite_counts(update_index_array)
+    if update_counts["nonfinite_count"]:
+        raise NonFiniteStepError(
+            "Encountered non-finite SR update.",
+            details={"source": "sr_update", "update": update_counts},
+        )
 
     update = jnp.zeros((vstate.n_parameters,), dtype=complex)
     update = update.at[active_indices].set(update_index)
     _, reassemble = convert_tree_to_dense_format(vstate.parameters, "holomorphic")
     update_tree = nkjax.tree_cast(reassemble(update), vstate.parameters)
-    if _tree_has_nonfinite(update_tree):
-        raise NonFiniteStepError("Encountered non-finite parameter update tree.")
+    update_tree_counts = _tree_nonfinite_counts(update_tree)
+    if update_tree_counts["nonfinite_count"]:
+        raise NonFiniteStepError(
+            "Encountered non-finite parameter update tree.",
+            details={"source": "parameter_update_tree", "tree": update_tree_counts},
+        )
 
     eigvals = np.asarray(jnp.linalg.eigvalsh(Sd))
     finite_eig = np.abs(eigvals[np.isfinite(eigvals)])
@@ -941,7 +1230,10 @@ def _heun_substep(
 
     if _tree_has_nonfinite(vstate.parameters):
         vstate.parameters = old_parameters
-        raise NonFiniteStepError("Accepted parameter tree contains non-finite values.")
+        raise NonFiniteStepError(
+            "Accepted parameter tree contains non-finite values.",
+            details={"source": "accepted_parameter_tree", "tree": _tree_nonfinite_counts(vstate.parameters)},
+        )
 
     post_energy, _ = _expect_operator(
         vstate,
@@ -957,10 +1249,16 @@ def _heun_substep(
     )
     if not _stats_are_finite(post_energy):
         vstate.parameters = old_parameters
-        raise NonFiniteStepError("Encountered non-finite post-step energy.")
+        raise NonFiniteStepError(
+            "Encountered non-finite post-step energy.",
+            details={"source": "post_step_energy", "energy": _stats_payload(post_energy)},
+        )
     if not _stats_are_finite(post_bp):
         vstate.parameters = old_parameters
-        raise NonFiniteStepError("Encountered non-finite post-step Bp.")
+        raise NonFiniteStepError(
+            "Encountered non-finite post-step Bp.",
+            details={"source": "post_step_bp", "bp": _stats_payload(post_bp)},
+        )
 
     payload = {
         "energy": _stats_payload(post_energy),
@@ -1173,10 +1471,17 @@ def _fresh_metadata(
             "n_layers": stage.n_layers,
             "gamma": 0.0,
             "last_record": None,
+            "accepted_iterations": 0,
+            "skipped_iterations": 0,
+            "consecutive_skipped_iterations": 0,
+            "skip_reasons": {},
         }
     return {
         "schema_version": 1,
         "status": "running",
+        "health_status": "ok",
+        "warning_count": 0,
+        "warnings": [],
         "function": "wrapper.workflow.run",
         "config_hash": config_hash,
         "config": config_payload,
@@ -1516,6 +1821,7 @@ def _advance_iteration_adaptive(
     max_resample_attempts = int(evolution_settings["variance_resample_attempts"])
     accepted_substeps = 0
     retry_count = 0
+    retry_events = []
     last_payload = None
     substep_index = 0
 
@@ -1540,22 +1846,31 @@ def _advance_iteration_adaptive(
             sampler_seed = _reinitialize_sampler(vstate, modules=modules)
             retry_count += 1
             current_step *= 0.5
+            retry_event = {
+                "event": "substep_retried",
+                "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "stage": stage.name,
+                "phase_iteration": phase_iteration,
+                "attempt": retry_count,
+                "next_step_size": current_step,
+                "sampler_seed": sampler_seed,
+                "error": str(exc),
+                "details": getattr(exc, "details", {}),
+            }
+            retry_events.append(retry_event)
             _append_jsonl(
                 logs["training_log"],
-                {
-                    "event": "substep_retried",
-                    "time": datetime.now().astimezone().isoformat(timespec="seconds"),
-                    "stage": stage.name,
-                    "phase_iteration": phase_iteration,
-                    "attempt": retry_count,
-                    "next_step_size": current_step,
-                    "sampler_seed": sampler_seed,
-                    "error": str(exc),
-                },
+                retry_event,
             )
             if retry_count > max_retries or current_step < min_step:
                 raise NonFiniteStepError(
-                    f"Step failed after {retry_count} retries; last error: {exc}"
+                    f"Step failed after {retry_count} retries; last error: {exc}",
+                    details={
+                        "source": "adaptive_step_failed",
+                        "retry_count": retry_count,
+                        "last_error": str(exc),
+                        "last_details": getattr(exc, "details", {}),
+                    },
                 ) from exc
             continue
 
@@ -1586,7 +1901,14 @@ def _advance_iteration_adaptive(
         )
 
     if last_payload is None:
-        raise NonFiniteStepError("No accepted substep was produced.")
+        raise NonFiniteStepError(
+            "No accepted substep was produced.",
+            details={
+                "source": "adaptive_no_accepted_substep",
+                "retry_count": retry_count,
+                "retry_events": retry_events,
+            },
+        )
 
     return {
         "event": "iteration_completed",
@@ -1601,6 +1923,7 @@ def _advance_iteration_adaptive(
         "target_step_size": float(target_interval),
         "accepted_substeps": int(accepted_substeps),
         "retry_count": int(retry_count),
+        "retry_events": retry_events,
         "active_parameter_count": int(len(active_indices)),
         "energy": last_payload["energy"],
         "bp": last_payload["bp"],
@@ -1670,9 +1993,10 @@ def _canonical_sr_direction(
         O = qgt.O[:, active_indices] / g.N
         rhs = delta_energy / (np.sqrt(vstate.n_samples) * g.N)
     update_index = cnn._sr_update_param_space(O, rhs, float(rcond))
-    has_nan = bool(jnp.any(jnp.isnan(update_index)))
 
     update_index_array = np.asarray(update_index)
+    update_counts = _array_nonfinite_counts(update_index_array)
+    has_nonfinite = bool(update_counts["nonfinite_count"])
     update = jnp.zeros((vstate.n_parameters,), dtype=complex)
     update = update.at[active_indices].set(update_index)
     _, reassemble = convert_tree_to_dense_format(vstate.parameters, "holomorphic")
@@ -1684,7 +2008,12 @@ def _canonical_sr_direction(
         "update_l2_norm": float(np.linalg.norm(update_index_array)),
         "update_max_abs": float(np.max(np.abs(update_index_array))) if update_index_array.size else 0.0,
         "variance_resamples": int(resample_count),
-        "has_nan": has_nan,
+        "has_nan": bool(update_counts["nan_count"]),
+        "has_nonfinite": has_nonfinite,
+        "update_size": update_counts["size"],
+        "update_nan_count": update_counts["nan_count"],
+        "update_inf_count": update_counts["inf_count"],
+        "update_nonfinite_count": update_counts["nonfinite_count"],
     }
     if blurred_data is not None:
         info["blurred_sampling"] = {
@@ -1693,7 +2022,7 @@ def _canonical_sr_direction(
             "kernel": str(blurred_sampling_settings["kernel"]),
             "ess": _json_value(blurred_data["ess"]),
         }
-    return update_tree, energy_stats, has_nan, info
+    return update_tree, energy_stats, has_nonfinite, info
 
 
 def _advance_iteration_canonical(
@@ -1745,7 +2074,7 @@ def _advance_iteration_canonical(
             "completed_total_iterations": int(total_completed_iterations),
             "dt": float(stage.dt),
             "target_step_size": float(target_interval),
-            "skip_reason": "nan_update_k1",
+            "skip_reason": "nan_update_k1" if step1_info.get("update_nan_count", 0) else "nonfinite_update_k1",
             "energy": _stats_payload(pre_energy),
             "step1": step1_info,
         }
@@ -1776,7 +2105,7 @@ def _advance_iteration_canonical(
             "completed_total_iterations": int(total_completed_iterations),
             "dt": float(stage.dt),
             "target_step_size": float(target_interval),
-            "skip_reason": "nan_update_k2",
+            "skip_reason": "nan_update_k2" if step2_info.get("update_nan_count", 0) else "nonfinite_update_k2",
             "energy": _stats_payload(midpoint_energy),
             "update_reference_energy_pre": _stats_payload(pre_energy),
             "step1": step1_info,
@@ -1918,6 +2247,9 @@ def _write_final_summary(
         output_path,
         {
             "status": "completed",
+            "health_status": metadata.get("health_status", "ok"),
+            "warning_count": len(metadata.get("warnings", [])),
+            "warnings": metadata.get("warnings", []),
             "completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "config": config_payload,
             "lattice": lattice_payload,
@@ -2249,6 +2581,7 @@ def run(
                     if record.get("accepted", True):
                         previous_variance = float(np.real(np.asarray(record["energy"].get("Variance", np.nan))))
                     stage_meta["completed_iterations"] = iteration + 1
+                    _update_stage_health_counters(stage_meta, record)
                     stage_meta["status"] = _phase_status(iteration + 1, target)
                     if record.get("accepted", True):
                         stage_meta["gamma"] = float(stage_meta.get("gamma", 0.0)) + interval
@@ -2256,6 +2589,13 @@ def run(
                     metadata["completed_total_iterations"] = int(metadata.get("completed_total_iterations", 0)) + 1
                     metadata["current_stage"] = stage.name
                     _append_jsonl(logs["training_log"], record)
+                    _emit_iteration_nonfinite_warnings(
+                        logs=logs,
+                        metadata=metadata,
+                        record=record,
+                        stage_meta=stage_meta,
+                        started_at=started_at,
+                    )
 
                     if show_progress and (
                         record["phase_iteration"] == 1
@@ -2326,6 +2666,13 @@ def run(
                     energy=(stage_meta.get("last_record") or {}).get("energy"),
                     bp=(stage_meta.get("last_record") or {}).get("bp"),
                 )
+                _emit_stage_completion_warnings(
+                    logs=logs,
+                    metadata=metadata,
+                    stage_meta=stage_meta,
+                    stage_name=stage.name,
+                    started_at=started_at,
+                )
 
             metadata["status"] = "training_completed"
             metadata["current_stage"] = None
@@ -2379,6 +2726,19 @@ def run(
         except _InterruptedForRequeue as exc:
             pending_interrupt_signum = exc.signum
         except Exception as exc:
+            if isinstance(exc, NonFiniteStepError):
+                _emit_workflow_warning(
+                    code="nonfinite_step_failed",
+                    logs=logs,
+                    metadata=metadata,
+                    severity="error",
+                    started_at=started_at,
+                    source="adaptive_failure" if _is_truthy(evolution_settings.get("adaptive_substeps")) else "canonical_failure",
+                    current_stage=metadata.get("current_stage"),
+                    completed_total_iterations=metadata.get("completed_total_iterations"),
+                    error=str(exc),
+                    details=getattr(exc, "details", {}),
+                )
             _append_diagnostic(
                 logs["diagnostics_log"],
                 "run_failed",
