@@ -92,6 +92,7 @@ class CheckpointInfo:
 class CheckpointArchitecture:
     family: str
     n_features: int | None
+    n_layers: int | None
     has_mean_field: bool
     has_deep_cnn: bool
     has_color_kernels: bool
@@ -126,7 +127,18 @@ def parse_L(path: Path) -> int:
 
 def looks_color_resolved(path: Path) -> bool:
     text = str(path).lower()
-    return "_hx_red_" in text or "_hz_red_" in text or "hx_red" in text or "hz_red" in text
+    markers = (
+        "hx_red",
+        "hy_red",
+        "hz_red",
+        "hx_green",
+        "hy_green",
+        "hz_green",
+        "hx_blue",
+        "hy_blue",
+        "hz_blue",
+    )
+    return any(marker in text for marker in markers)
 
 
 def resolve_bool_mode(mode: str, *, auto: bool) -> bool:
@@ -215,6 +227,34 @@ def _param_shape(flat: dict[tuple[str, ...], Any], key: tuple[str, ...]) -> tupl
     return tuple(int(x) for x in shape) if shape is not None else None
 
 
+def _deep_cnn_kernel_keys(flat: dict[tuple[str, ...], Any], branch: str) -> list[tuple[str, ...]]:
+    keys = []
+    for key in flat:
+        if len(key) < 3 or key[0] != branch or key[-1] != "W":
+            continue
+        layer_name = key[-2]
+        if layer_name == "input_conv" or str(layer_name).startswith("residual_conv_"):
+            keys.append(key)
+        elif str(layer_name).startswith("conv2_"):
+            keys.append(key)
+    return sorted(keys)
+
+
+def _infer_deep_cnn_shape(flat: dict[tuple[str, ...], Any]) -> tuple[tuple[int, ...] | None, int | None]:
+    keys = _deep_cnn_kernel_keys(flat, "deep_CNN_0")
+    if not keys:
+        return None, None
+
+    first_key = next((key for key in keys if key[-2] == "input_conv"), keys[0])
+    first_shape = _param_shape(flat, first_key)
+    current_style_layers = [
+        key for key in keys if key[-2] == "input_conv" or str(key[-2]).startswith("residual_conv_")
+    ]
+    if current_style_layers:
+        return first_shape, len(current_style_layers)
+    return first_shape, len(keys)
+
+
 def validate_checkpoint_params(params, label: str) -> None:
     bad = []
     for key, value in _flat_params(params).items():
@@ -240,7 +280,7 @@ def infer_checkpoint_architecture(params) -> CheckpointArchitecture:
     flat = _flat_params(params)
     has_mean_field = any(key[:1] in (("mean_field0",), ("mean_field1",)) for key in flat)
     has_deep_cnn = any(key[:1] in (("deep_CNN_0",), ("deep_CNN_1",)) for key in flat)
-    first_kernel_shape = _param_shape(flat, ("deep_CNN_0", "conv2_0", "W"))
+    first_kernel_shape, n_layers = _infer_deep_cnn_shape(flat)
     n_features = first_kernel_shape[-1] if first_kernel_shape is not None else None
     has_color_kernels = bool(first_kernel_shape is not None and len(first_kernel_shape) == 4)
 
@@ -256,6 +296,7 @@ def infer_checkpoint_architecture(params) -> CheckpointArchitecture:
     return CheckpointArchitecture(
         family=family,
         n_features=n_features,
+        n_layers=n_layers,
         has_mean_field=has_mean_field,
         has_deep_cnn=has_deep_cnn,
         has_color_kernels=has_color_kernels,
@@ -289,6 +330,7 @@ def make_legacy_cnn_symmetric(cnn, architecture: CheckpointArchitecture, info: C
         use_small_point_group: bool = False
         use_color_labels: bool = False
         n_features: int = architecture.n_features
+        n_layers: int = 2 if architecture.n_layers is None else architecture.n_layers
 
         @nn.compact
         def __call__(self, x):
@@ -297,7 +339,11 @@ def make_legacy_cnn_symmetric(cnn, architecture: CheckpointArchitecture, info: C
                 x = x[:, rotation_group].reshape((-1, cnn.g.N))
 
             u0 = cnn.phase2(x)
-            y1 = cnn.deep_CNN(n_features=self.n_features, use_color_labels=self.use_color_labels)(u0)
+            y1 = cnn.deep_CNN(
+                n_features=self.n_features,
+                n_layers=self.n_layers,
+                use_color_labels=self.use_color_labels,
+            )(u0)
 
             u1 = jnp.stack(
                 (
@@ -306,7 +352,11 @@ def make_legacy_cnn_symmetric(cnn, architecture: CheckpointArchitecture, info: C
                 ),
                 axis=-1,
             )
-            y2 = cnn.deep_CNN(n_features=self.n_features, use_color_labels=self.use_color_labels)(u1)
+            y2 = cnn.deep_CNN(
+                n_features=self.n_features,
+                n_layers=self.n_layers,
+                use_color_labels=self.use_color_labels,
+            )(u1)
 
             out = jnp.sum(cnn.activation4(y1 + y2), axis=[1, 2]) / jnp.sqrt(3)
             if self.rotation:
@@ -333,6 +383,7 @@ def build_checkpoint_model(cnn, info: CheckpointInfo, architecture: CheckpointAr
             use_small_point_group=info.use_small_point_group,
             use_color_labels=info.use_color_labels,
             n_features=architecture.n_features,
+            n_layers=2 if architecture.n_layers is None else architecture.n_layers,
         )
 
     if architecture.family == "mean_field_symmetric":
